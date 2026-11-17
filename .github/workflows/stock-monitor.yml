@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Choose a stock check or send a test email"
+        required: true
+        default: stock_check
+        type: choice
+        options:
+          - stock_check
+          - test_email
 
 permissions:
   contents: write
@@ -14,6 +23,7 @@ concurrency:
 
 jobs:
   check-stock:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.run_mode == 'stock_check' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -29,6 +39,7 @@ jobs:
         run: python -m py_compile monitor.py
       - name: Check product stock
         env:
+          MONITOR_MODE: stock_check
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -45,3 +56,29 @@ jobs:
             git commit -m "Update monitored stock state"
             git push
           fi
+
+  test-email:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'test_email' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Check Python syntax
+        run: python -m py_compile monitor.py
+      - name: Send test email
+        env:
+          MONITOR_MODE: test_email
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python monitor.py
