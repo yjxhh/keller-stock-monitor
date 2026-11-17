@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Keller 55 mm product stock and email on restock transitions."""
+"""Monitor Keller 55 mm product stock and send email notifications."""
 from __future__ import annotations
 
 import json
@@ -29,7 +29,7 @@ PRODUCTS = {
 }
 STATE_FILE = Path("data/stock_state.json")
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; KellerStockMonitor/1.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; KellerStockMonitor/1.1)",
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
 SOLD_OUT = (
@@ -113,35 +113,108 @@ def save_state(state: dict[str, str]) -> None:
     )
 
 
-def send_restock_email(products: list[dict[str, str]]) -> None:
+def email_settings() -> tuple[str, int, str, str, str, str]:
     required = (
         "SMTP_HOST", "SMTP_PORT", "SMTP_USER",
         "SMTP_PASSWORD", "MAIL_FROM", "MAIL_TO",
     )
     missing = [key for key in required if not os.getenv(key)]
     if missing:
-        raise RuntimeError("Missing GitHub Actions secrets: " + ", ".join(missing))
+        raise RuntimeError(
+            "Missing GitHub Actions secrets: " + ", ".join(missing)
+        )
+    try:
+        port = int(os.environ["SMTP_PORT"])
+    except ValueError as exc:
+        raise RuntimeError("SMTP_PORT must be a number, for example 587 or 465.") from exc
 
+    return (
+        os.environ["SMTP_HOST"],
+        port,
+        os.environ["SMTP_USER"],
+        os.environ["SMTP_PASSWORD"],
+        os.environ["MAIL_FROM"],
+        os.environ["MAIL_TO"],
+    )
+
+
+def send_email(message: EmailMessage) -> None:
+    host, port, username, password, _, _ = email_settings()
+    print(f"SMTP: connecting to {host}:{port} ...")
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                print("SMTP: SSL connection established; authenticating ...")
+                smtp.login(username, password)
+                print("SMTP: authentication successful; sending message ...")
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+                print("SMTP: STARTTLS connection established; authenticating ...")
+                smtp.login(username, password)
+                print("SMTP: authentication successful; sending message ...")
+                smtp.send_message(message)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise RuntimeError(
+            f"SMTP authentication failed (code {exc.smtp_code}). "
+            "Check SMTP_USER and SMTP_PASSWORD; many providers require an app password."
+        ) from exc
+    except smtplib.SMTPConnectError as exc:
+        raise RuntimeError(
+            f"SMTP connection rejected (code {exc.smtp_code}): {exc.smtp_error!r}"
+        ) from exc
+    except smtplib.SMTPRecipientsRefused as exc:
+        raise RuntimeError(
+            f"SMTP rejected recipient address(es): {list(exc.recipients.keys())}"
+        ) from exc
+    except smtplib.SMTPException as exc:
+        raise RuntimeError(f"SMTP error while sending email: {exc}") from exc
+    print("SMTP: message accepted by the outgoing mail server.")
+
+
+def send_restock_email(products: list[dict[str, str]]) -> None:
+    _, _, _, _, mail_from, mail_to = email_settings()
     message = EmailMessage()
     message["Subject"] = f"Keller 补货提醒：{len(products)} 款商品可能有货"
-    message["From"] = os.environ["MAIL_FROM"]
-    message["To"] = os.environ["MAIL_TO"]
+    message["From"] = mail_from
+    message["To"] = mail_to
     lines = ["Keller 监控发现以下商品可能已经恢复库存：", ""]
     for product in products:
         lines.extend((product["name"], product["url"], ""))
     lines.append("请打开商品页面再次确认库存。")
     message.set_content("\n".join(lines))
+    send_email(message)
 
-    with smtplib.SMTP(
-        os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"]), timeout=30
-    ) as smtp:
-        smtp.starttls()
-        smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
-        smtp.send_message(message)
-    print("Restock notification email sent.")
+
+def send_test_email() -> None:
+    _, _, _, _, mail_from, mail_to = email_settings()
+    message = EmailMessage()
+    message["Subject"] = "Keller 库存监控 - 邮件配置测试"
+    message["From"] = mail_from
+    message["To"] = mail_to
+    message.set_content(
+        "这是一封 Keller 库存监控测试邮件。\n\n"
+        "如果你收到这封邮件，说明 GitHub Actions 已成功连接 SMTP 并提交邮件。\n"
+        "测试邮件不会修改商品库存状态。\n"
+    )
+    print(f"Test email recipient: {mail_to}")
+    send_email(message)
 
 
 def main() -> int:
+    mode = os.getenv("MONITOR_MODE", "stock_check").strip().lower()
+    if mode == "test_email":
+        send_test_email()
+        print("Test email completed successfully. Stock state was not read or changed.")
+        return 0
+    if mode != "stock_check":
+        raise RuntimeError(
+            f"Unknown MONITOR_MODE={mode!r}; expected 'stock_check' or 'test_email'."
+        )
+
     session = requests.Session()
     session.headers.update(HEADERS)
     previous = load_state()
@@ -165,9 +238,11 @@ def main() -> int:
             failures += 1
             print(f'ERROR {product["name"]}: {exc}', file=sys.stderr)
 
-    # Preserve all old states if any page could not be checked/classified.
     if failures:
-        print(f"{failures} product check(s) unresolved; state was not changed.", file=sys.stderr)
+        print(
+            f"{failures} product check(s) unresolved; state was not changed.",
+            file=sys.stderr,
+        )
         return 1
 
     if restocked:
@@ -179,4 +254,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"FATAL: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
